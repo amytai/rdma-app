@@ -1,4 +1,4 @@
-OBJECTS := test test2
+OBJECTS := test
 
 all: $(OBJECTS)
 
