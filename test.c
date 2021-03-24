@@ -40,6 +40,9 @@
 #define GID_1   0xb4aa23feff4b6b52 
 #define GID_2   0x0caf23feff4b6b52
 
+#define SEND_OPID	0x123
+#define RECV_OPID	0xdead
+
 int main(int argc, char *argv[])
 {
 	struct ibv_device **dev_list;
@@ -169,7 +172,7 @@ int main(int argc, char *argv[])
 		.lkey	= mr->lkey,
 	};
 	struct ibv_recv_wr wr = {
-		.wr_id	    = 0xdead,
+		.wr_id	    = RECV_OPID,
 		.sg_list    = &list,
 		.num_sge    = 1,
 	};
@@ -237,7 +240,7 @@ int main(int argc, char *argv[])
                     .lkey	= mr->lkey
             };
             struct ibv_send_wr send_wr = {
-                    .wr_id	    = 0x123,
+                    .wr_id	= SEND_OPID,
                     .sg_list    = &send_list,
                     .num_sge    = 1,
                     .opcode     = IBV_WR_SEND,
@@ -270,6 +273,11 @@ int main(int argc, char *argv[])
             return 1;
     } else {
         fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
+	// If it's a recv, post a new recv!
+	if (wc.wr_id == RECV_OPID) {
+		if (ibv_post_recv(qp, &wr, &bad_wr))
+			fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
+	}
     }
     }
 
