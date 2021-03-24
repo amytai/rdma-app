@@ -31,15 +31,30 @@
  */
 
 #include <stdio.h>
-
 #include <endian.h>
 
 #include <infiniband/verbs.h>
+
+#define	CLIENT_ARG	"client"
+#define	CLIENT_ARG_LEN	strlen(CLIENT_ARG)
+#define GID_1   0xb4aa23feff4b6b52 
+#define GID_2   0x0caf23feff4b6b52
 
 int main(int argc, char *argv[])
 {
 	struct ibv_device **dev_list;
 	int num_devices, i;
+
+	int client = 0;
+	// didn't use getopt.h to avoid Linux dependencies
+	// If there is an argument, "client", then it's the client. Otherwise is server
+	if (argc > 1) {
+		if (!memcmp(argv[1], CLIENT_ARG, CLIENT_ARG_LEN)) {
+			client = 1;
+			printf("You are running the pingpong client\n");
+		} else
+			printf("You are running the pingpong server\n");
+	}
 
 	dev_list = ibv_get_device_list(&num_devices);
 	if (!dev_list) {
@@ -58,8 +73,6 @@ int main(int argc, char *argv[])
     
     struct ibv_context *ctx = ibv_open_device(dev_list[1]);	
     struct ibv_device_attr attr;
-
-    attr.max_qp = 123;
 
     if (ctx == NULL)
         printf("ibv_open_device failed?errno: %d\n", errno);
@@ -128,6 +141,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "results of query: %d %d %d %d\n", query_qp_attr.qp_state, query_qp_attr.port_num, query_qp_attr.qp_access_flags, query_qp_attr.qkey);
     }
 
+    /* AT THIS POINT, all resources are created. Now we need to connect the QPs */
     /* Now we need to move the QP through some state machine state, including connecting to remote QP */
 
     /* Move QP from RESET to INIT state */
@@ -169,7 +183,7 @@ int main(int argc, char *argv[])
     if (ibv_query_gid(ctx, 1, 0, &my_gid)) {
         fprintf(stderr, "could not get gid for port %d, index %d\n", 1, 0);
     }
-    fprintf(stderr, "gid: %lld", my_gid.global.subnet_prefix);
+    fprintf(stderr, "gid: %016lx\n", my_gid.global.interface_id);
 
     /* Now we need to move the QP from INIT to RTR */
     memset(&qp_attr, 0, sizeof(qp_attr));
@@ -184,16 +198,81 @@ int main(int argc, char *argv[])
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = 1;
 
+    union ibv_gid remote_gid;
+    remote_gid.global.subnet_prefix = 0x80fe;
+    // Set the interface_id to the hard-coded id that is NOT the gid of this machine
+    if (my_gid.global.interface_id == GID_1)
+        remote_gid.global.interface_id = GID_2;
+    else
+        remote_gid.global.interface_id = GID_1;
+
     qp_attr.ah_attr.is_global = 1; // Over ROCE means this has to be global
     qp_attr.ah_attr.grh.hop_limit = 1;
-    qp_attr.ah_attr.grh.dgid = my_gid;
+    qp_attr.ah_attr.grh.dgid = remote_gid;
     qp_attr.ah_attr.grh.sgid_index = 0;
     
     if (ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
                       IBV_QP_DEST_QPN | IBV_QP_RQ_PSN))
         fprintf(stderr, "unf, modify_qp to rtr failed, errno: %d\n", errno);
 
-    /* AT THIS POINT, all resources are created. Now we need to connect the QPs */
+    //TODO: we also need to move qp to a RTS state....
+    qp_attr.qp_state = IBV_QPS_RTS;
+    qp_attr.sq_psn = qp->qp_num;
+    if (ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_SQ_PSN))
+        fprintf(stderr, "unf, modify_qp to rts failed, errno: %d\n", errno);
+    
+    memset(&query_qp_attr, 0, sizeof(query_qp_attr));
+    if (ibv_query_qp(qp, &query_qp_attr, IBV_QP_QKEY | IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_PORT , &query_init_attr)) {
+        fprintf(stderr, "lol, query_qp failed, errno: %d\n", errno);
+    } else {
+        fprintf(stderr, "state: %d\n", query_qp_attr.qp_state);
+    }
+
+    /* OK, now the QP should be set up, and we are ready to send packets */
+    /* Only send if you're the server */
+    if (!client) {
+            struct ibv_sge send_list = {
+                    .addr	= (uintptr_t) rdma_buf,
+                    .length = buf_size,
+                    .lkey	= mr->lkey
+            };
+            struct ibv_send_wr send_wr = {
+                    .wr_id	    = 0x123,
+                    .sg_list    = &send_list,
+                    .num_sge    = 1,
+                    .opcode     = IBV_WR_SEND,
+                    //.send_flags = ctx.send_flags,
+            };
+            struct ibv_send_wr *send_bad_wr;
+
+	if (ibv_post_send(qp, &send_wr, &send_bad_wr))
+        fprintf(stderr,  "oh god, post_send didn't work..\n");
+    }
+
+    struct ibv_wc wc;
+    int ne;
+
+    while (1) {
+    do {
+            ne = ibv_poll_cq(cq, 1, &wc);
+            if (ne < 0) {
+                    fprintf(stderr, "poll CQ failed %d\n", ne);
+                    return 1;
+            }
+
+    } while (ne < 1);
+
+    fprintf(stderr, "LOL ne: %d?\n", ne);
+    if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+                            ibv_wc_status_str(wc.status),
+                            wc.status, (int) wc.wr_id);
+            return 1;
+    } else {
+        fprintf(stderr, "LOL the hardware successfully sent a send packet... wr_id: %x\n", (int) wc.wr_id);
+    }
+    }
+
 
     ibv_destroy_qp(qp);
     ibv_destroy_cq(cq);
