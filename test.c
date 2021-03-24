@@ -169,7 +169,7 @@ int main(int argc, char *argv[])
 		.lkey	= mr->lkey,
 	};
 	struct ibv_recv_wr wr = {
-		.wr_id	    = 0,
+		.wr_id	    = 0xdead,
 		.sg_list    = &list,
 		.num_sge    = 1,
 	};
@@ -190,7 +190,7 @@ int main(int argc, char *argv[])
     qp_attr.qp_state = IBV_QPS_RTR;
 
     qp_attr.path_mtu = IBV_MTU_512; // This is the recommended value
-    qp_attr.dest_qp_num = 79; // This is the remote qp_num
+    qp_attr.dest_qp_num = 236; // This is the remote qp_num
     qp_attr.rq_psn = 0;
 
     qp_attr.ah_attr.dlid = 0; // this is likely 0 if the remote has only 1 port
@@ -269,7 +269,7 @@ int main(int argc, char *argv[])
                             wc.status, (int) wc.wr_id);
             return 1;
     } else {
-        fprintf(stderr, "LOL the hardware successfully sent a send packet... wr_id: %x\n", (int) wc.wr_id);
+        fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
     }
     }
 
