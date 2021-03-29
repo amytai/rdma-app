@@ -166,6 +166,10 @@ int main(int argc, char *argv[])
         fprintf(stderr, "unf, modify_qp to init failed, errno: %d\n", errno);
 
     // Now we need to post a receive request (RR)?
+    memset(rdma_buf, 7, buf_size);
+    rdma_buf[0] = 'l';
+    rdma_buf[1] = 'o';
+    rdma_buf[2] = 'l';
     struct ibv_sge list = {
 		.addr	= (uintptr_t) rdma_buf,
 		.length = buf_size,
@@ -193,7 +197,7 @@ int main(int argc, char *argv[])
     qp_attr.qp_state = IBV_QPS_RTR;
 
     qp_attr.path_mtu = IBV_MTU_512; // This is the recommended value
-    qp_attr.dest_qp_num = 236; // This is the remote qp_num
+    qp_attr.dest_qp_num = 240; // This is the remote qp_num
     qp_attr.rq_psn = 0;
 
     qp_attr.ah_attr.dlid = 0; // this is likely 0 if the remote has only 1 port
