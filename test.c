@@ -277,6 +277,7 @@ int main(int argc, char *argv[])
 	if (wc.wr_id == RECV_OPID) {
 		if (ibv_post_recv(qp, &wr, &bad_wr))
 			fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
+		fprintf(stderr, "content of rdma_buf after recv: %s\n", rdma_buf);
 	}
     }
     }
