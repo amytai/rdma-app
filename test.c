@@ -37,8 +37,8 @@
 
 #define	CLIENT_ARG	"client"
 #define	CLIENT_ARG_LEN	strlen(CLIENT_ARG)
-#define GID_1   0xb4aa23feff4b6b52 
-#define GID_2   0x0caf23feff4b6b52
+#define GID_1   0x05a923feff4b6b52
+#define GID_2   0x25a823feff4b6b52
 
 #define SEND_OPID	0x123
 #define RECV_OPID	0xdead
