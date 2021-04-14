@@ -32,13 +32,16 @@
 
 #include <stdio.h>
 #include <endian.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include <infiniband/verbs.h>
 
 #define	CLIENT_ARG	"client"
 #define	CLIENT_ARG_LEN	strlen(CLIENT_ARG)
 #define GID_1   0x05a923feff4b6b52
-#define GID_2   0x25a823feff4b6b52
+#define GID_2   0x2da823feff4b6b52 //25a823feff4b6b52
 
 #define SEND_OPID	0x123
 #define RECV_OPID	0xdead
@@ -47,16 +50,18 @@ int main(int argc, char *argv[])
 {
 	struct ibv_device **dev_list;
 	int num_devices, i;
+  int remote_qp_num = 2000;
 
 	int client = 0;
 	// didn't use getopt.h to avoid Linux dependencies
 	// If there is an argument, "client", then it's the client. Otherwise is server
 	if (argc > 1) {
-		if (!memcmp(argv[1], CLIENT_ARG, CLIENT_ARG_LEN)) {
+		/*if (!memcmp(argv[1], CLIENT_ARG, CLIENT_ARG_LEN)) {
 			client = 1;
 			printf("You are running the pingpong client\n");
 		} else
-			printf("You are running the pingpong server\n");
+			printf("You are running the pingpong server\n");*/
+    remote_qp_num = atoi(argv[1]);
 	}
 
 	dev_list = ibv_get_device_list(&num_devices);
@@ -105,7 +110,7 @@ int main(int argc, char *argv[])
     struct ibv_mr *mr;
     struct ibv_mr *mr_read;
     mr = ibv_reg_mr(pd, rdma_buf, buf_size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-    mr_read = ibv_reg_mr(pd, rdma_buf_read, buf_size, IBV_ACCESS_REMOTE_READ);
+    mr_read = ibv_reg_mr(pd, rdma_buf_read, buf_size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
 
     if (mr == NULL || mr_read == NULL) 
         printf("unf, ibv_reg_mr failed\n");
@@ -166,14 +171,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "unf, modify_qp to init failed, errno: %d\n", errno);
 
     // Now we need to post a receive request (RR)?
-    memset(rdma_buf, 7, buf_size);
-    rdma_buf[0] = 'l';
-    rdma_buf[1] = 'o';
-    rdma_buf[2] = 'l';
+
     struct ibv_sge list = {
-		.addr	= (uintptr_t) rdma_buf,
+		.addr	= (uintptr_t) rdma_buf_read,
 		.length = buf_size,
-		.lkey	= mr->lkey,
+		.lkey	= mr_read->lkey,
 	};
 	struct ibv_recv_wr wr = {
 		.wr_id	    = RECV_OPID,
@@ -197,7 +199,7 @@ int main(int argc, char *argv[])
     qp_attr.qp_state = IBV_QPS_RTR;
 
     qp_attr.path_mtu = IBV_MTU_512; // This is the recommended value
-    qp_attr.dest_qp_num = 240; // This is the remote qp_num
+    qp_attr.dest_qp_num = remote_qp_num; // This is the remote qp_num
     qp_attr.rq_psn = 0;
 
     qp_attr.ah_attr.dlid = 0; // this is likely 0 if the remote has only 1 port
@@ -234,25 +236,40 @@ int main(int argc, char *argv[])
     } else {
         fprintf(stderr, "state: %d\n", query_qp_attr.qp_state);
     }
+    
+    // Start sending over the helloworld binary
+    memset(rdma_buf, 0, buf_size);
 
+    int fd = open("helloworld", O_RDONLY);
+    if (fd < 0)
+      fprintf(stderr, "lol couldn't open binary\n");
+
+    int res = read(fd, rdma_buf, buf_size);
+    if (res < 0)
+      fprintf(stderr, "unf binary read failed\n");
+    if (res == 0)
+      fprintf(stderr, "read returned 0 bytes");
+    
+
+    struct ibv_sge send_list = {
+      .addr	= (uintptr_t) rdma_buf,
+      .length = buf_size,
+      .lkey	= mr->lkey
+    };
+    struct ibv_send_wr send_wr = {
+      .wr_id	= SEND_OPID,
+      .sg_list    = &send_list,
+      .num_sge    = 1,
+      .opcode     = IBV_WR_SEND,
+      //.send_flags = ctx.send_flags,
+    };
+    int sent = 0;
+    struct ibv_send_wr *send_bad_wr;
     /* OK, now the QP should be set up, and we are ready to send packets */
     /* Only send if you're the server */
     if (!client) {
-            struct ibv_sge send_list = {
-                    .addr	= (uintptr_t) rdma_buf,
-                    .length = buf_size,
-                    .lkey	= mr->lkey
-            };
-            struct ibv_send_wr send_wr = {
-                    .wr_id	= SEND_OPID,
-                    .sg_list    = &send_list,
-                    .num_sge    = 1,
-                    .opcode     = IBV_WR_SEND,
-                    //.send_flags = ctx.send_flags,
-            };
-            struct ibv_send_wr *send_bad_wr;
 
-	if (ibv_post_send(qp, &send_wr, &send_bad_wr))
+      if (ibv_post_send(qp, &send_wr, &send_bad_wr))
         fprintf(stderr,  "oh god, post_send didn't work..\n");
     }
 
@@ -276,16 +293,37 @@ int main(int argc, char *argv[])
                             wc.status, (int) wc.wr_id);
             return 1;
     } else {
-        fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
-	// If it's a recv, post a new recv!
-	if (wc.wr_id == RECV_OPID) {
-		if (ibv_post_recv(qp, &wr, &bad_wr))
-			fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
-		fprintf(stderr, "content of rdma_buf after recv: %s\n", rdma_buf);
-	}
+      fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
+      // If it's a recv, post a new recv!
+      if (wc.wr_id == RECV_OPID) {
+        if (ibv_post_recv(qp, &wr, &bad_wr))
+          fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
+        fprintf(stderr, "content of rdma_buf after recv: %s\n", rdma_buf_read);
+        
+        // This means we can send more stuff
+        sent++;
+        if (sent > 20)
+          continue;
+
+        int res = read(fd, rdma_buf, buf_size);
+        if (res < 0)
+          fprintf(stderr, "lol fd read didn't work\n");
+        if (res == 0) {
+          fprintf(stderr, "nothing more in binary\n");
+          continue;
+        }
+        if (res < buf_size) {
+          rdma_buf[res+1]='\0';
+        }
+        if (ibv_post_send(qp, &send_wr, &send_bad_wr))
+            fprintf(stderr, "oh god, post_send didn't work..\n");
+        else
+          printf("ok, just sent another buf\n");
+      }
     }
     }
 
+    close(fd);
 
     ibv_destroy_qp(qp);
     ibv_destroy_cq(cq);
