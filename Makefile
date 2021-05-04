@@ -8,7 +8,7 @@ $(OBJECTS): %: %.c
 	gcc -g -I/usr/include/ $< -o $@ -libverbs
 
 $(HELLO): %: %.c
-	gcc -g -o $(HELLO) $< -static
+	gcc -g -static -o $(HELLO) $< -static
 
 $(ELF): %: %.c
 	gcc -g -o $(ELF) $<
