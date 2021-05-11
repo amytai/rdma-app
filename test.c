@@ -41,7 +41,7 @@
 
 #define	CLIENT_ARG	"client"
 #define	CLIENT_ARG_LEN	strlen(CLIENT_ARG)
-#define GID_1   0x05a923feff4b6b52
+#define GID_1   0x25a823feff4b6b52
 #define GID_2   0x2da823feff4b6b52 //25a823feff4b6b52
 //#define GID_2   0xa9c24dfefff6ceba //0x2da823feff4b6b52 //0xa9c24dfefff6ceba //25a823feff4b6b52
 
