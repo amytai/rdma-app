@@ -36,11 +36,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <elf.h>
 
 #include <infiniband/verbs.h>
 
-#define	CLIENT_ARG	"client"
-#define	CLIENT_ARG_LEN	strlen(CLIENT_ARG)
 #define GID_1   0x25a823feff4b6b52
 #define GID_2   0x2da823feff4b6b52 //25a823feff4b6b52
 //#define GID_2   0xa9c24dfefff6ceba //0x2da823feff4b6b52 //0xa9c24dfefff6ceba //25a823feff4b6b52
@@ -48,25 +47,31 @@
 #define SEND_OPID	0x123
 #define RECV_OPID	0xdead
 
+struct region_request {
+ Elf64_Addr start;
+ uint64_t size;
+};
+
+struct region_response {
+  int success;
+};
+
+struct run_exokernel_request {
+  uint64_t stack_ptr;
+  uint64_t entry_point;
+};
+
+
 int main(int argc, char *argv[])
 {
 	struct ibv_device **dev_list;
 	int num_devices, i, fd;
 	int remote_qp_num = 2300;
 
-	int client = 0;
 	// didn't use getopt.h to avoid Linux dependencies
-	// If there is an argument, "client", then it's the client. Otherwise is server
     if (argc > 1) {
 		remote_qp_num = atoi(argv[1]);
     }
-	if (argc > 2) {
-		if (!memcmp(argv[2], CLIENT_ARG, CLIENT_ARG_LEN)) {
-			client = 1;
-			printf("You are running the pingpong client\n");
-		} else
-			printf("You are running the pingpong server\n");
-	}
 
 	dev_list = ibv_get_device_list(&num_devices);
 	if (!dev_list) {
@@ -242,24 +247,8 @@ int main(int argc, char *argv[])
 
     /**** Now we have finished setting up RDMA ****/
 
-
-    // Start sending over the helloworld binary
-    if (!client) {
-        memset(rdma_buf, 0, buf_size);
-
-        fd = open("helloworld", O_RDONLY);
-        if (fd < 0)
-            fprintf(stderr, "lol couldn't open binary\n");
-
-        int res = read(fd, rdma_buf, buf_size);
-        if (res < 0)
-            fprintf(stderr, "unf binary read failed\n");
-        if (res == 0)
-            fprintf(stderr, "read returned 0 bytes");
-    } else {
-        fd = open("received_bin", O_CREAT | O_WRONLY);
-    }
-
+    // Prepare to receive the binary
+    fd = open("received_bin", O_CREAT | O_WRONLY);
 
     struct ibv_sge send_list = {
         .addr	= (uintptr_t) rdma_buf,
@@ -276,11 +265,6 @@ int main(int argc, char *argv[])
     int sent = 0;
     struct ibv_send_wr *send_bad_wr;
     /* OK, now the QP should be set up, and we are ready to send packets */
-    /* Only send if you're the server */
-    if (!client) {
-        if (ibv_post_send(qp, &send_wr, &send_bad_wr))
-            fprintf(stderr,  "oh god, post_send didn't work..\n");
-    }
 
     struct ibv_wc wc;
     int ne;
@@ -302,52 +286,23 @@ int main(int argc, char *argv[])
                     wc.status, (int) wc.wr_id);
             return 1;
         } else {
-            fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
-            if (!client) {
-                // If it's a recv, post a new recv!
-                if (wc.wr_id == RECV_OPID) {
-                    if (ibv_post_recv(qp, &wr, &bad_wr))
-                        fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
-                    fprintf(stderr, "content of rdma_buf after recv: %s\n", rdma_buf_read);
+          fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
+          // If it's a recv, post a new recv!
+          if (wc.wr_id == RECV_OPID) {
+            if (ibv_post_recv(qp, &wr, &bad_wr))
+              fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
+            fprintf(stderr, "length of recv: %d, \ncontent of rdma_buf_read after recv: %s\n", 
+                wr.sg_list->length, (char *) wr.sg_list->addr);
+            write(fd, (void *) wr.sg_list->addr, wr.sg_list->length);
 
-                    // This means we can send more stuff
-                    sent++;
-                    if (sent > 20)
-                        continue;
+            // Now tell the other side we are ready for the next one
+            rdma_buf[0]='a';
+            rdma_buf[1]='c';
+            rdma_buf[2]='k';
 
-                    int res = read(fd, rdma_buf, buf_size);
-                    if (res < 0)
-                        fprintf(stderr, "lol fd read didn't work\n");
-                    if (res == 0) {
-                        fprintf(stderr, "nothing more in binary\n");
-                        continue;
-                    }
-                    if (res < buf_size) {
-                        rdma_buf[res+1]='\0';
-                    }
-                    if (ibv_post_send(qp, &send_wr, &send_bad_wr))
-                        fprintf(stderr, "oh god, post_send didn't work..\n");
-                    else
-                        printf("ok, just sent another buf\n");
-                }
-            } else {
-                // If it's a recv, post a new recv!
-                if (wc.wr_id == RECV_OPID) {
-                    if (ibv_post_recv(qp, &wr, &bad_wr))
-                        fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
-                    fprintf(stderr, "length of recv: %d, \ncontent of rdma_buf_read after recv: %s\n", 
-                            wr.sg_list->length, (char *) wr.sg_list->addr);
-                    write(fd, (void *) wr.sg_list->addr, wr.sg_list->length);
-
-                    // Now tell the other side we are ready for the next one
-                    rdma_buf[0]='a';
-                    rdma_buf[1]='c';
-                    rdma_buf[2]='k';
-
-                    if (ibv_post_send(qp, &send_wr, &send_bad_wr))
-                        fprintf(stderr,  "oh god, post_send didn't work..\n");
-                }
-            }
+            if (ibv_post_send(qp, &send_wr, &send_bad_wr))
+              fprintf(stderr,  "oh god, post_send didn't work..\n");
+          }
         }
     }
 

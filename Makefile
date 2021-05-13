@@ -1,4 +1,4 @@
-OBJECTS := test
+OBJECTS := controller exokernel
 HELLO := helloworld
 ELF := elf
 
