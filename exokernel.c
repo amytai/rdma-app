@@ -1,71 +1,18 @@
-/*
- * Copyright (c) 2004 Topspin Communications.  All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <endian.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <elf.h>
 
-#include <infiniband/verbs.h>
-
-#define GID_1   0x25a823feff4b6b52
-#define GID_2   0x2da823feff4b6b52 //25a823feff4b6b52
-//#define GID_2   0xa9c24dfefff6ceba //0x2da823feff4b6b52 //0xa9c24dfefff6ceba //25a823feff4b6b52
-
-#define SEND_OPID	0x123
-#define RECV_OPID	0xdead
-
-struct region_request {
- Elf64_Addr start;
- uint64_t size;
-};
-
-struct region_response {
-  int success;
-};
-
-struct run_exokernel_request {
-  uint64_t stack_ptr;
-  uint64_t entry_point;
-};
-
+#include "helper.h"
 
 int main(int argc, char *argv[])
 {
 	struct ibv_device **dev_list;
-	int num_devices, i, fd;
+	int num_devices, i;
 	int remote_qp_num = 2300;
 
 	// didn't use getopt.h to avoid Linux dependencies
@@ -247,8 +194,7 @@ int main(int argc, char *argv[])
 
     /**** Now we have finished setting up RDMA ****/
 
-    // Prepare to receive the binary
-    fd = open("received_bin", O_CREAT | O_WRONLY);
+    // Prepare to receive RPC requests
 
     struct ibv_sge send_list = {
         .addr	= (uintptr_t) rdma_buf,
@@ -264,7 +210,6 @@ int main(int argc, char *argv[])
     };
     int sent = 0;
     struct ibv_send_wr *send_bad_wr;
-    /* OK, now the QP should be set up, and we are ready to send packets */
 
     struct ibv_wc wc;
     int ne;
@@ -289,24 +234,45 @@ int main(int argc, char *argv[])
           fprintf(stderr, "LOL completed a send or receive  packet... wr_id: %x\n", (int) wc.wr_id);
           // If it's a recv, post a new recv!
           if (wc.wr_id == RECV_OPID) {
-            if (ibv_post_recv(qp, &wr, &bad_wr))
-              fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
-            fprintf(stderr, "length of recv: %d, \ncontent of rdma_buf_read after recv: %s\n", 
-                wr.sg_list->length, (char *) wr.sg_list->addr);
-            write(fd, (void *) wr.sg_list->addr, wr.sg_list->length);
-
+            struct exokernel_rpc *rpc = (struct exokernel_rpc *) wr.sg_list->addr;
+            fprintf(stderr, "rpc type: %d\n", rpc->type);
+            struct region_request *req = (struct region_request *) &rpc->payload.rreq;
+            fprintf(stderr, "rreq start: %lx, size: %lx\n", req->start, req->size);
+          
+            void *region = mmap((void *) req->start, req->size, PROT_EXEC | PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             // Now tell the other side we are ready for the next one
-            rdma_buf[0]='a';
-            rdma_buf[1]='c';
-            rdma_buf[2]='k';
+            struct region_response resp = {
+              .success = ((uint64_t) region == req->start),
+            };
+
+            marshall_region_response(&resp, rdma_buf);
+
+            // Now post a recv for newly mmaped region
+            struct ibv_mr *new_mr;
+            new_mr = ibv_reg_mr(pd, region, req->size, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+
+            if (new_mr == NULL)
+              printf("unf, ibv_reg_mr failed\n");
+
+            struct ibv_sge new_list = {
+              .addr	= (uintptr_t) region,
+              .length = req->size,
+              .lkey	= new_mr->lkey,
+            };
+            struct ibv_recv_wr new_wr = {
+              .wr_id	    = RECV_OPID,
+              .sg_list    = &list,
+              .num_sge    = 1,
+            };
+
+            if (ibv_post_recv(qp, &new_wr, &bad_wr))
+              fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
 
             if (ibv_post_send(qp, &send_wr, &send_bad_wr))
               fprintf(stderr,  "oh god, post_send didn't work..\n");
           }
         }
     }
-
-    close(fd);
 
     ibv_destroy_qp(qp);
     ibv_destroy_cq(cq);

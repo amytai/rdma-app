@@ -4,35 +4,38 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <elf.h>
 
 #include "helper.h"
 
-int send_binary(char *rdma_buf, int buf_size, struct ibv_qp *qp, struct ibv_cq *cq,
-        struct ibv_send_wr *send_wr, struct ibv_recv_wr *wr) {
+int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz, Elf64_Off p_offset, 
+        struct ibv_send_wr *send_wr, struct ibv_qp *qp, struct ibv_cq *cq, struct ibv_recv_wr *wr) {
     struct ibv_wc wc;
     struct ibv_recv_wr *bad_wr;
     struct ibv_send_wr *send_bad_wr;
-    int ne;
-    int fd;
-    int sent = 0;
+    size_t mmap_length;
+    void *region;
+	int err, ne;
+	size_t cur_offset;
+	size_t offset = p_vaddr - (p_vaddr / 4096) * 4096;
 
-    memset(rdma_buf, 0, buf_size);
+	mmap_length = (((p_filesz) / 4096) + 1) * 4096;
 
-    fd = open("helloworld", O_RDONLY);
-    if (fd < 0)
-      fprintf(stderr, "lol couldn't open binary\n");
-
-    int res = read(fd, rdma_buf, buf_size);
-    if (res < 0)
-      fprintf(stderr, "unf binary read failed\n");
-    if (res == 0)
-      fprintf(stderr, "read returned 0 bytes");
+    // Now we make a region request:
+    struct region_request req = {
+        .start = p_vaddr - offset,
+        .size = mmap_length,
+    };
+    
+    // Now copy this region request into the send buffer
+    marshall_region_request(&req, (void *)send_wr->sg_list->addr);
 
     if (ibv_post_send(qp, send_wr, &send_bad_wr))
-      fprintf(stderr,  "oh god, post_send didn't work..\n");
+        DEBUG_PRINT("oh god, post_send didn't work..\n");
 
-    while (1) {
+    int done = 0;
+    while (!done) {
         do {
             ne = ibv_poll_cq(cq, 1, &wc);
             if (ne < 0) {
@@ -55,6 +58,104 @@ int send_binary(char *rdma_buf, int buf_size, struct ibv_qp *qp, struct ibv_cq *
 
             if (ibv_post_recv(qp, wr, &bad_wr))
               fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
+
+            struct exokernel_rpc *rpc = (struct exokernel_rpc *) wr->sg_list->addr;
+            if (rpc->type == rpc_region_response) {
+                if (rpc->payload.rresp.success) {
+                // OK now that we received the response for this RPC, we can continue
+                    DEBUG_PRINT("received successful region_response\n");
+                    done = 1;
+                }
+            }
+          } else
+            DEBUG_PRINT("completed a send packet\n");
+        }
+    }
+
+    // Now we have to RDMA the segment into the mmap'd region.
+
+	/*cur_offset = lseek(fd, 0, SEEK_CUR);
+	if (cur_offset < 0) {
+		printf("hmmm lseek had problem: %d\n", errno);
+		return -1;
+	}
+	ERR(lseek(fd, p_offset, SEEK_SET));
+	ERR(read(fd, (void *)region + offset, p_filesz));
+
+	// Now return lseek to the program header table
+	ERR(lseek(fd, cur_offset, SEEK_SET));*/
+
+	return 0;
+}
+
+int send_binary(struct ibv_qp *qp, struct ibv_cq *cq,
+        struct ibv_send_wr *send_wr, struct ibv_recv_wr *wr) {
+    struct ibv_wc wc;
+    struct ibv_recv_wr *bad_wr;
+    struct ibv_send_wr *send_bad_wr;
+    int ne;
+    int fd;
+    int sent = 0;
+
+    memset((void *) send_wr->sg_list->addr, 0, send_wr->sg_list->length);
+
+    /* First we parse the ELF file and find the loadable segments and BSS section.
+       For each of these regions, we send a region_request to the exokernel, which
+       tells the exokernel which memory regions to prepare.
+     */
+    Elf64_Ehdr header;
+    Elf64_Shdr sh_header;
+    Elf64_Phdr ph_header;
+    uint32_t names_table_offset;
+    char *str_table;
+    int err;
+
+    fd = open("helloworld", O_RDONLY);
+    if (fd < 0) {
+        printf("couldn't open binary\n");
+        return fd;
+    }
+
+    // Read the ELF header
+    ERR(read(fd, (void *)&header, sizeof(header)));
+
+    // Now go to the program header sections
+    ERR(lseek(fd, header.e_phoff, SEEK_SET));
+    for (int i = 0; i < header.e_phnum; i++) {
+        ERR(read(fd, (void *)&ph_header, sizeof(ph_header)));
+
+        if (ph_header.p_type != PT_LOAD)
+            continue;
+
+	    ERR(load_segment(fd, ph_header.p_vaddr, ph_header.p_filesz, ph_header.p_offset, send_wr, qp, cq, wr));
+    }
+
+
+    while (1) {
+        do {
+            ne = ibv_poll_cq(cq, 1, &wc);
+            if (ne < 0) {
+                DEBUG_PRINT("poll CQ failed %d\n", ne);
+                return 1;
+            }
+
+        } while (ne < 1);
+
+        DEBUG_PRINT("num entries polled: %d\n", ne);
+        if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+                    ibv_wc_status_str(wc.status),
+                    wc.status, (int) wc.wr_id);
+            return 1;
+        } else {
+          // If it's a recv, post a new recv!
+          if (wc.wr_id == RECV_OPID) {
+            DEBUG_PRINT("completed a receive packet\n");
+
+            
+
+            /*if (ibv_post_recv(qp, wr, &bad_wr))
+              fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
             fprintf(stderr, "content of rdma_buf after recv: %s\n", (char *) wr->sg_list->addr);
 
             // This means we can send more stuff
@@ -75,7 +176,7 @@ int send_binary(char *rdma_buf, int buf_size, struct ibv_qp *qp, struct ibv_cq *
             if (ibv_post_send(qp, send_wr, &send_bad_wr))
               DEBUG_PRINT("oh god, post_send didn't work..\n");
             else
-              DEBUG_PRINT("ok, just sent another buf\n");
+              DEBUG_PRINT("ok, just sent another buf\n");*/
           } else
             DEBUG_PRINT("completed a send packet\n");
         }
@@ -287,7 +388,7 @@ int main(int argc, char *argv[])
         //.send_flags = ctx.send_flags,
     };
 
-    if (send_binary(rdma_buf, buf_size, qp, cq, &send_wr, &wr))
+    if (send_binary(qp, cq, &send_wr, &wr))
         DEBUG_PRINT("something failed with send_binary\n");
 
 
