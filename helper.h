@@ -19,6 +19,15 @@
 #define RECV_OPID	0xdead
 #define ONE_SIDED_WRITE_OPID    0x456
 
+struct ibv_helper_context {
+    struct ibv_context *ctx;
+    struct ibv_qp *qp;
+    struct ibv_cq *cq;
+    struct ibv_pd *pd;
+    struct ibv_mr *send_mr;
+    struct ibv_mr *recv_mr;
+};
+
 enum rpc_type {
     rpc_region_request = 0,
     rpc_region_response = 1,
