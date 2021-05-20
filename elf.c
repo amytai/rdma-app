@@ -23,7 +23,7 @@ int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz, Elf64_Off p_of
 	size_t cur_offset;
 	size_t offset = p_vaddr - (p_vaddr / 4096) * 4096;
 
-	mmap_length[region_num] = (((p_filesz) / 4096) + 1) * 4096;
+	mmap_length[region_num] = (((p_filesz + offset) / 4096) + 1) * 4096;
 
 	printf("about to mmap length: %lx\n", mmap_length[region_num]);
 
@@ -54,10 +54,15 @@ void setup_stack_and_jump(Elf64_Addr e_entry) {
     stack += (1024 * 1024 * 1024);
 
     __asm__ ( "mov %0, %%r8;" // Save header.e_entry before we change the stack
-              "mov %1, %%r10;" // Save "stack" var
+              "mov %1, %%r9;" // Save "stack" var
+              "mov %2, %%r10;" // Save "stack" var
             :
-            : "m" (e_entry), "r" (stack - 32)
+            : "m" (e_entry), "m" (stack), "r" (stack - 32)
             );
+
+    __asm__ (
+        "mov %r9,%rsp;"
+        );
 
    /* __asm__ (
               "lea 0x28(%rip),%rdx;"
