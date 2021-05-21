@@ -46,6 +46,7 @@ static int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz,
   };
 
   // Now copy this region request into the send buffer
+  memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
   marshall_region_request(&req, (void *)send_wr.sg_list->addr);
 
   if (ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr))
@@ -152,6 +153,7 @@ static int setup_stack(Elf64_Addr e_entry,
       .start = STACK_BOTTOM,
       .size = STACK_SIZE,
   };
+  memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
   marshall_region_request(&req, (void *)send_wr.sg_list->addr);
 
   if (ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr))
@@ -188,26 +190,24 @@ static int setup_stack(Elf64_Addr e_entry,
         scratch_buf[2] = 0;  // NULL envp
         scratch_buf[3] = 25; // aux AT_RANDOM
         scratch_buf[4] = rpc->payload.rresp.remote_addr + STACK_SIZE -
-                         32; // address of RANDOM values
-        scratch_buf[5] = 9;  // some other AUX var
+                         8 * 4; // address of RANDOM values
+        scratch_buf[5] = 9;     // some other AUX var
         scratch_buf[6] = e_entry;
         scratch_buf[7] = 0;
         scratch_buf[8] = 0;
 
         // AT_RANDOM values
-        scratch_buf[9] = 0xdeadbeef;
-        scratch_buf[10] = 0xabcd1234;
-        scratch_buf[11] = 0xdeadbeef;
-        scratch_buf[12] = 0xabcd1234;
+        scratch_buf[9] = 0xdeadbeefabcd1234;
+        scratch_buf[10] = 0xdeadbeefabcd1234;
 
         // Now write shit to that MR, and send another RPC, to check
         send_wr.wr_id = ONE_SIDED_WRITE_OPID;
         send_wr.opcode = IBV_WR_RDMA_WRITE;
         send_wr.wr.rdma.remote_addr =
-            rpc->payload.rresp.remote_addr + STACK_SIZE - 13 * 4;
+            rpc->payload.rresp.remote_addr + STACK_SIZE - 11 * 8;
         send_wr.wr.rdma.rkey = rpc->payload.rresp.rkey;
 
-        send_wr.sg_list->length = 13 * 4;
+        send_wr.sg_list->length = 11 * 8;
 
         if (ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr))
           DEBUG_PRINT(
@@ -283,12 +283,83 @@ static int send_binary(struct ibv_helper_context *helper_context,
   }
   // TODO: set up BSS section
 
+  // Now go to the section string table
+  names_table_offset = header.e_shoff + sizeof(Elf64_Shdr) * header.e_shstrndx;
+  ERR(lseek(fd, names_table_offset, SEEK_SET));
+  // Read the str table section header
+  ERR(read(fd, (void *)&sh_header, sizeof(sh_header)));
+
+  // Now read the str table section contents into a buffer
+  str_table = (char *)malloc(sh_header.sh_size);
+
+  ERR(lseek(fd, sh_header.sh_offset, SEEK_SET));
+  ERR(read(fd, (void *)str_table, sh_header.sh_size));
+
+  // Now reset the fd offset to the beginning of the sh sections
+  ERR(lseek(fd, header.e_shoff, SEEK_SET));
+
+  for (int i = 0; i < header.e_shnum; i++) {
+    ERR(read(fd, (void *)&sh_header, sizeof(sh_header)));
+    if (!strncmp(str_table + sh_header.sh_name, ".bss", 4)) {
+      size_t offset, mmap_length;
+      DEBUG_PRINT("FOUND BSS SECTION!\n");
+
+      offset = (sh_header.sh_addr / 4096 + 1) *
+               4096; // sh_header.sh_addr - (sh_header.sh_addr / 4096) * 4096;
+      mmap_length = ((sh_header.sh_size / 4096) + 1) * 4096;
+
+      struct region_request req = {
+          .start = offset,
+          .size = mmap_length,
+      };
+
+      memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
+      marshall_region_request(&req, (void *)send_wr.sg_list->addr);
+      if (ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr))
+        DEBUG_PRINT("oh god, post_send didn't work for run_exokernel..\n");
+      else
+        DEBUG_PRINT("ok, just requested BSS section\n");
+
+      while (1) {
+        ERR(poll_cq(helper_context, &wc));
+
+        // If it's a recv, post a new recv!
+        if (wc.wr_id == RECV_OPID) {
+          DEBUG_PRINT("completed a receive packet\n");
+
+          if (ibv_post_recv(helper_context->qp, recv_wr, &bad_wr))
+            fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
+
+          struct exokernel_rpc *rpc =
+              (struct exokernel_rpc *)recv_wr->sg_list->addr;
+          if (rpc->type == rpc_region_response) {
+            if (rpc->payload.rresp.success) {
+              // OK now that we received the response for this RPC, we can
+              // continue
+              DEBUG_PRINT("received successful region_response \
+                                  remote_addr: %lx \
+                                  rkey: %x \n",
+                          rpc->payload.rresp.remote_addr,
+                          rpc->payload.rresp.rkey);
+
+              break;
+            }
+          }
+        } else {
+          DEBUG_PRINT("completed a send packet\n");
+        }
+      }
+    } else
+      continue;
+  }
+  free(str_table);
+
   // Now we have to set up the stack
   ERR(setup_stack(header.e_entry, helper_context, recv_wr));
 
   // Now the exokernel is ready to run
   struct run_exokernel_request req = {
-      .stack_ptr = STACK_BOTTOM + STACK_SIZE - 13 * 4,
+      .stack_ptr = STACK_BOTTOM + STACK_SIZE - 11 * 8,
       .entry_point = header.e_entry,
   };
   marshall_run_exokernel_request(&req, (void *)send_wr.sg_list->addr);

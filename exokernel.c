@@ -125,27 +125,32 @@ int main(int argc, char *argv[]) {
 
         void *region = mmap((void *)req->start, req->size,
                             PROT_EXEC | PROT_WRITE | PROT_READ,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                            MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         memset(region, 0, req->size);
         saved_region = region;
 
-        // Register newly mapped region as mr with ibv
-        struct ibv_mr *new_mr;
-        new_mr = ibv_reg_mr(helper_context.pd, region, req->size,
-                            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+        struct region_response resp;
+        if (req->start != (uint64_t)0x6bc000) {
+          // Register newly mapped region as mr with ibv
+          struct ibv_mr *new_mr;
+          new_mr = ibv_reg_mr(helper_context.pd, region, req->size,
+                              IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
 
-        if (new_mr == NULL)
-          printf("unf, ibv_reg_mr failed\n");
+          if (new_mr == NULL)
+            printf("unf, ibv_reg_mr failed, errno: %d\n", errno);
 
-        // Now tell the other side we are ready for the next one
-        struct region_response resp = {
-            .success = ((uint64_t)region == req->start),
-            .remote_addr = (uint64_t)region,
-            .rkey = new_mr->rkey,
-        };
+          // Now tell the other side we are ready for the next one
+          resp.success = ((uint64_t)region == req->start);
+          resp.remote_addr = (uint64_t)region;
+          resp.rkey = new_mr->rkey;
+        } else {
+          resp.success = 1;
+          resp.remote_addr = 0;
+          resp.rkey = 0;
+        }
 
         fprintf(stderr, "region_response sending remote_addr: %lx, rkey: %x\n",
-                (uint64_t)region, new_mr->rkey);
+                resp.remote_addr, resp.rkey);
 
         marshall_region_response(&resp, (void *)send_wr.sg_list->addr);
 
@@ -167,6 +172,8 @@ int main(int argc, char *argv[]) {
         __asm__("mov %0,%%r9; "
                 "mov %1,%%r8;"
                 "mov %%r9,%%rsp;"
+                //"lea 0x4(%%rip),%%r10;"
+                //"push %%r10;"
                 "jmp *%%r8;"
                 :
                 : "m"(req->stack_ptr), "m"(req->entry_point));
