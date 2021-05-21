@@ -116,7 +116,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "seemed to post recv..\n");
 
       struct exokernel_rpc *rpc = (struct exokernel_rpc *)wr.sg_list->addr;
-      fprintf(stderr, "rpc type: %d\n", rpc->type);
+      DEBUG_PRINT("rpc type: %d\n", rpc->type);
       switch (rpc->type) {
       case rpc_region_request: {
         struct region_request *req =
@@ -130,7 +130,7 @@ int main(int argc, char *argv[]) {
         saved_region = region;
 
         struct region_response resp;
-        if (req->start != (uint64_t)0x6bc000) {
+        if (req->enable_mr) {
           // Register newly mapped region as mr with ibv
           struct ibv_mr *new_mr;
           new_mr = ibv_reg_mr(helper_context.pd, region, req->size,
@@ -149,9 +149,6 @@ int main(int argc, char *argv[]) {
           resp.rkey = 0;
         }
 
-        fprintf(stderr, "region_response sending remote_addr: %lx, rkey: %x\n",
-                resp.remote_addr, resp.rkey);
-
         marshall_region_response(&resp, (void *)send_wr.sg_list->addr);
 
         if (ibv_post_send(helper_context.qp, &send_wr, &send_bad_wr))
@@ -159,10 +156,7 @@ int main(int argc, char *argv[]) {
         break;
       }
       case rpc_run_exokernel_request:
-
-        printf("lol got run_exoerkenel request. now check to see if they wrote "
-               "anything in my buffer\n");
-        printf("%s\n", (char *)saved_region);
+        DEBUG_PRINT("got run_exokernel_request\n");
 
         struct run_exokernel_request *req =
             (struct run_exokernel_request *)&rpc->payload.rereq;

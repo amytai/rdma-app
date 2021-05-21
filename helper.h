@@ -57,6 +57,7 @@ enum rpc_type {
 struct region_request {
   Elf64_Addr start;
   uint64_t size;
+  int enable_mr;
 };
 
 struct region_response {

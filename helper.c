@@ -183,6 +183,7 @@ void marshall_region_request(struct region_request *req, void *buf) {
           {
               .start = req->start,
               .size = req->size,
+              .enable_mr = req->enable_mr,
           },
   };
   memcpy(buf, (void *)&rpc, sizeof(rpc));

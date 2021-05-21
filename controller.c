@@ -43,6 +43,7 @@ static int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz,
   struct region_request req = {
       .start = p_vaddr - offset,
       .size = mmap_length,
+      .enable_mr = 1,
   };
 
   // Now copy this region request into the send buffer
@@ -129,6 +130,72 @@ static int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz,
   return 0;
 }
 
+static int setup_bss(Elf64_Addr sh_addr, uint64_t sh_size,
+                     struct ibv_helper_context *helper_context,
+                     struct ibv_recv_wr *recv_wr) {
+  int err;
+  size_t offset, mmap_length;
+  struct ibv_wc wc;
+  struct ibv_recv_wr *bad_wr;
+  struct ibv_send_wr *send_bad_wr;
+  struct ibv_sge send_list = {
+      .addr = (uintptr_t)helper_context->send_mr->addr,
+      .length = helper_context->send_mr->length,
+      .lkey = helper_context->send_mr->lkey,
+  };
+  struct ibv_send_wr send_wr = {
+      .wr_id = SEND_OPID,
+      .sg_list = &send_list,
+      .num_sge = 1,
+      .opcode = IBV_WR_SEND,
+  };
+
+  offset = (sh_addr / 4096 + 1) *
+           4096; // sh_header.sh_addr - (sh_header.sh_addr / 4096) * 4096;
+  mmap_length = ((sh_size / 4096) + 1) * 4096;
+
+  struct region_request req = {
+      .start = offset,
+      .size = mmap_length,
+      .enable_mr = 0,
+  };
+
+  memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
+  marshall_region_request(&req, (void *)send_wr.sg_list->addr);
+
+  ERR(ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr));
+  DEBUG_PRINT("ok, just requested BSS section\n");
+
+  while (1) {
+    ERR(poll_cq(helper_context, &wc));
+
+    // If it's a recv, post a new recv!
+    if (wc.wr_id == RECV_OPID) {
+      DEBUG_PRINT("completed a receive packet\n");
+
+      ERR(ibv_post_recv(helper_context->qp, recv_wr, &bad_wr));
+
+      struct exokernel_rpc *rpc =
+          (struct exokernel_rpc *)recv_wr->sg_list->addr;
+      if (rpc->type == rpc_region_response) {
+        if (rpc->payload.rresp.success) {
+          // OK now that we received the response for this RPC, we can
+          // continue
+          DEBUG_PRINT("received successful region_response \
+                            remote_addr: %lx \
+                            rkey: %x \n",
+                      rpc->payload.rresp.remote_addr, rpc->payload.rresp.rkey);
+
+          break;
+        }
+      }
+    } else {
+      DEBUG_PRINT("completed a send packet\n");
+    }
+  }
+  return 0;
+}
+
 static int setup_stack(Elf64_Addr e_entry,
                        struct ibv_helper_context *helper_context,
                        struct ibv_recv_wr *recv_wr) {
@@ -152,6 +219,7 @@ static int setup_stack(Elf64_Addr e_entry,
   struct region_request req = {
       .start = STACK_BOTTOM,
       .size = STACK_SIZE,
+      .enable_mr = 1,
   };
   memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
   marshall_region_request(&req, (void *)send_wr.sg_list->addr);
@@ -233,7 +301,6 @@ static int send_binary(struct ibv_helper_context *helper_context,
   struct ibv_recv_wr *bad_wr;
   struct ibv_send_wr *send_bad_wr;
   int fd;
-  int sent = 0;
   struct ibv_sge send_list = {
       .addr = (uintptr_t)helper_context->send_mr->addr,
       .length = helper_context->send_mr->length,
@@ -245,8 +312,6 @@ static int send_binary(struct ibv_helper_context *helper_context,
       .num_sge = 1,
       .opcode = IBV_WR_SEND,
   };
-
-  memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
 
   /* First we parse the ELF file and find the loadable segments and BSS section.
      For each of these regions, we send a region_request to the exokernel, which
@@ -281,9 +346,9 @@ static int send_binary(struct ibv_helper_context *helper_context,
     ERR(load_segment(fd, ph_header.p_vaddr, ph_header.p_filesz,
                      ph_header.p_offset, helper_context, recv_wr));
   }
-  // TODO: set up BSS section
 
-  // Now go to the section string table
+  // Now set up BSS section
+  // Go to the section string table
   names_table_offset = header.e_shoff + sizeof(Elf64_Shdr) * header.e_shstrndx;
   ERR(lseek(fd, names_table_offset, SEEK_SET));
   // Read the str table section header
@@ -301,54 +366,10 @@ static int send_binary(struct ibv_helper_context *helper_context,
   for (int i = 0; i < header.e_shnum; i++) {
     ERR(read(fd, (void *)&sh_header, sizeof(sh_header)));
     if (!strncmp(str_table + sh_header.sh_name, ".bss", 4)) {
-      size_t offset, mmap_length;
       DEBUG_PRINT("FOUND BSS SECTION!\n");
 
-      offset = (sh_header.sh_addr / 4096 + 1) *
-               4096; // sh_header.sh_addr - (sh_header.sh_addr / 4096) * 4096;
-      mmap_length = ((sh_header.sh_size / 4096) + 1) * 4096;
-
-      struct region_request req = {
-          .start = offset,
-          .size = mmap_length,
-      };
-
-      memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
-      marshall_region_request(&req, (void *)send_wr.sg_list->addr);
-      if (ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr))
-        DEBUG_PRINT("oh god, post_send didn't work for run_exokernel..\n");
-      else
-        DEBUG_PRINT("ok, just requested BSS section\n");
-
-      while (1) {
-        ERR(poll_cq(helper_context, &wc));
-
-        // If it's a recv, post a new recv!
-        if (wc.wr_id == RECV_OPID) {
-          DEBUG_PRINT("completed a receive packet\n");
-
-          if (ibv_post_recv(helper_context->qp, recv_wr, &bad_wr))
-            fprintf(stderr, "lol, post_recv didn't work, errno: %d\n", errno);
-
-          struct exokernel_rpc *rpc =
-              (struct exokernel_rpc *)recv_wr->sg_list->addr;
-          if (rpc->type == rpc_region_response) {
-            if (rpc->payload.rresp.success) {
-              // OK now that we received the response for this RPC, we can
-              // continue
-              DEBUG_PRINT("received successful region_response \
-                                  remote_addr: %lx \
-                                  rkey: %x \n",
-                          rpc->payload.rresp.remote_addr,
-                          rpc->payload.rresp.rkey);
-
-              break;
-            }
-          }
-        } else {
-          DEBUG_PRINT("completed a send packet\n");
-        }
-      }
+      ERR(setup_bss(sh_header.sh_addr, sh_header.sh_size, helper_context,
+                    recv_wr));
     } else
       continue;
   }
@@ -362,6 +383,7 @@ static int send_binary(struct ibv_helper_context *helper_context,
       .stack_ptr = STACK_BOTTOM + STACK_SIZE - 11 * 8,
       .entry_point = header.e_entry,
   };
+  memset((void *)send_wr.sg_list->addr, 0, send_wr.sg_list->length);
   marshall_run_exokernel_request(&req, (void *)send_wr.sg_list->addr);
 
   if (ibv_post_send(helper_context->qp, &send_wr, &send_bad_wr))
