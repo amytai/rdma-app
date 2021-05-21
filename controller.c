@@ -11,29 +11,6 @@
 
 #define STACK_BOTTOM    0x700000000000
 #define STACK_SIZE      (1024 * 1024 * 1024)
-#define BUF_SIZE        1024
-
-static int poll_cq(struct ibv_cq *cq, struct ibv_wc *wc) {
-    int ne;
-    do {
-        ne = ibv_poll_cq(cq, 1, wc);
-        if (ne < 0) {
-            DEBUG_PRINT("poll CQ failed %d\n", ne);
-            return 1;
-        }
-
-    } while (ne < 1);
-
-    DEBUG_PRINT("num entries polled: %d\n", ne);
-    if (wc->status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-                ibv_wc_status_str(wc->status),
-                wc->status, (int) wc->wr_id);
-        return 1;
-    }
-
-    return 0;
-}
 
 static int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz, Elf64_Off p_offset, 
         struct ibv_helper_context *helper_context, struct ibv_recv_wr *recv_wr) {
@@ -80,7 +57,7 @@ static int load_segment(int fd, Elf64_Addr p_vaddr, Elf64_Addr p_filesz, Elf64_O
     void *mmapped_region;
 
     while (1) {
-        ERR(poll_cq(helper_context->cq, &wc));
+        ERR(poll_cq(helper_context, &wc));
 
         // If it's a recv, post a new recv!
         if (wc.wr_id == RECV_OPID) {
@@ -175,7 +152,7 @@ static int setup_stack(Elf64_Addr e_entry, struct ibv_helper_context *helper_con
     DEBUG_PRINT("just asked exokernel to allocate stack memoryr addr\n");
 
     while (1) {
-        ERR(poll_cq(helper_context->cq, &wc));
+        ERR(poll_cq(helper_context, &wc));
 
         // If it's a recv, post a new recv!
         if (wc.wr_id == RECV_OPID) {
@@ -306,7 +283,7 @@ static int send_binary(struct ibv_helper_context *helper_context, struct ibv_rec
     else
         DEBUG_PRINT("ok, just posted a run_exokernel_request\n");
 
-    ERR(poll_cq(helper_context->cq, &wc));
+    ERR(poll_cq(helper_context, &wc));
 
     if (wc.wr_id == SEND_OPID)
         DEBUG_PRINT("completed a send packet\n");
@@ -316,138 +293,6 @@ static int send_binary(struct ibv_helper_context *helper_context, struct ibv_rec
     close(fd);
 }
 
-static void create_helper_context(struct ibv_context *ctx, struct ibv_helper_context *helper_context) {
-    struct ibv_qp_init_attr qp_init_attr;
-    struct ibv_qp_init_attr query_init_attr;
-    struct ibv_qp_attr query_qp_attr;
-    void *rdma_buf;
-    void *rdma_buf_read;
-    int cq_size = 1;
-
-    rdma_buf = malloc(BUF_SIZE);
-    rdma_buf_read = malloc(BUF_SIZE);
-
-    helper_context->ctx = ctx;
-
-    /* Allocate a PD, in preparation for memory allocation */
-    helper_context->pd = ibv_alloc_pd(ctx);
-
-    helper_context->cq = ibv_create_cq(ctx, cq_size, NULL, NULL, 0);
-
-    memset(&qp_init_attr, 0, sizeof(qp_init_attr));
-
-    qp_init_attr.qp_context = ctx;
-    qp_init_attr.qp_type = IBV_QPT_UC;
-    qp_init_attr.sq_sig_all = 1;
-    qp_init_attr.send_cq = helper_context->cq;
-    qp_init_attr.recv_cq = helper_context->cq;
-    qp_init_attr.cap.max_send_wr = 1;
-    qp_init_attr.cap.max_recv_wr = 1;
-    qp_init_attr.cap.max_send_sge = 1;
-    qp_init_attr.cap.max_recv_sge = 1;
-
-    helper_context->qp = ibv_create_qp(helper_context->pd, &qp_init_attr);
-
-    if (helper_context->qp == NULL)
-        printf("lol qp is null\n");
-
-    fprintf(stderr, "qp_num: %d\n", helper_context->qp->qp_num);
-
-    // Try to query the attributes of the qp?
-    if (ibv_query_qp(helper_context->qp, &query_qp_attr, IBV_QP_QKEY | IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_PORT , &query_init_attr))
-        fprintf(stderr, "lol, query_qp failed, errno: %d\n", errno);
-    else
-        DEBUG_PRINT("results of query: %d %d %d %d\n", query_qp_attr.qp_state, query_qp_attr.port_num, query_qp_attr.qp_access_flags, query_qp_attr.qkey);
-    
-    helper_context->send_mr = ibv_reg_mr(helper_context->pd, rdma_buf, BUF_SIZE, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-    helper_context->recv_mr = ibv_reg_mr(helper_context->pd, rdma_buf_read, BUF_SIZE, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
-
-    if (helper_context->send_mr || helper_context->recv_mr == NULL) 
-        printf("unf, ibv_reg_mr failed\n");
-}
-
-static void destroy_helper_context(struct ibv_helper_context *helper_context) {
-    ibv_destroy_qp(helper_context->qp);
-    ibv_destroy_cq(helper_context->cq);
-
-    ibv_dereg_mr(helper_context->send_mr);
-    ibv_dereg_mr(helper_context->recv_mr);
-    ibv_dealloc_pd(helper_context->pd);
-    ibv_close_device(helper_context->ctx);
-}
-
-static void init_qp(struct ibv_helper_context *helper_context, int remote_qp_num) {
-    struct ibv_qp_init_attr query_init_attr;
-    struct ibv_qp_attr query_qp_attr;
-    struct ibv_qp_attr qp_attr;
-    union ibv_gid my_gid;
-    union ibv_gid remote_gid;
-
-    /* Move QP from RESET to INIT state */
-    memset(&qp_attr, 0, sizeof(qp_attr));
-
-    qp_attr.qp_state = IBV_QPS_INIT;
-    qp_attr.port_num = 1; // TODO: what's the port num??
-    qp_attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-
-    /* IMPORTANT: the flag masks that we pass to modify_qp depends on the qp_type
-     * (IBV_QPT_UD vs IBV_QPT_UC, etc). For example, for IBV_QPT_UD, the flags MUST be
-     * IBV_QP_STATE | IBV_QP_PORT | IBV_QP_QKEY | IBV_QP_PKEY_INDEX and for IBV_QPT_UC,
-     * the flags MUST be IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS.
-     *
-     * For this test, we are using IBV_QPT_UC (unreliable connected) type.
-     */
-    if (ibv_modify_qp(helper_context->qp, &qp_attr, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS | IBV_QP_PKEY_INDEX))
-        fprintf(stderr, "unf, modify_qp to init failed, errno: %d\n", errno);
-
-    /* Now we need to move the QP from INIT to RTR */
-    memset(&qp_attr, 0, sizeof(qp_attr));
-    qp_attr.qp_state = IBV_QPS_RTR;
-
-    qp_attr.path_mtu = IBV_MTU_512; // This is the recommended value
-    qp_attr.dest_qp_num = remote_qp_num; // This is the remote qp_num
-    qp_attr.rq_psn = 0;
-
-    qp_attr.ah_attr.dlid = 0; // this is likely 0 if the remote has only 1 port
-    qp_attr.ah_attr.sl = 0;
-    qp_attr.ah_attr.src_path_bits = 0;
-    qp_attr.ah_attr.port_num = 1;
-
-    // Inspect these GIDs...
-    if (ibv_query_gid(helper_context->ctx, 1, 0, &my_gid)) {
-        fprintf(stderr, "could not get gid for port %d, index %d\n", 1, 0);
-    }
-    DEBUG_PRINT("gid: %016llx\n", my_gid.global.interface_id);
-
-    remote_gid.global.subnet_prefix = 0x80fe;
-    // Set the interface_id to the hard-coded id that is NOT the gid of this machine
-    if (my_gid.global.interface_id == GID_1)
-        remote_gid.global.interface_id = GID_2;
-    else
-        remote_gid.global.interface_id = GID_1;
-
-    qp_attr.ah_attr.is_global = 1; // Over ROCE means this has to be global
-    qp_attr.ah_attr.grh.hop_limit = 1;
-    qp_attr.ah_attr.grh.dgid = remote_gid;
-    qp_attr.ah_attr.grh.sgid_index = 0;
-
-    if (ibv_modify_qp(helper_context->qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-                IBV_QP_DEST_QPN | IBV_QP_RQ_PSN))
-        fprintf(stderr, "unf, modify_qp to rtr failed, errno: %d\n", errno);
-
-    //We also need to move qp to a RTS state....
-    qp_attr.qp_state = IBV_QPS_RTS;
-    qp_attr.sq_psn = helper_context->qp->qp_num;
-    if (ibv_modify_qp(helper_context->qp, &qp_attr, IBV_QP_STATE | IBV_QP_SQ_PSN))
-        fprintf(stderr, "unf, modify_qp to rts failed, errno: %d\n", errno);
-
-    memset(&query_qp_attr, 0, sizeof(query_qp_attr));
-    if (ibv_query_qp(helper_context->qp, &query_qp_attr, IBV_QP_QKEY | IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_PORT , &query_init_attr)) {
-        fprintf(stderr, "lol, query_qp failed, errno: %d\n", errno);
-    } else {
-        fprintf(stderr, "state: %d\n", query_qp_attr.qp_state);
-    }
-}
 
 int main(int argc, char *argv[])
 {
@@ -458,7 +303,7 @@ int main(int argc, char *argv[])
 
     struct ibv_helper_context helper_context;
     
-    int num_devices, i;
+    int num_devices, i, err;
     int remote_qp_num = 2300;
 
     // didn't use getopt.h to avoid Linux dependencies
@@ -500,11 +345,11 @@ int main(int argc, char *argv[])
         printf("lid of port: %d\n", port_attr.lid);
     }
 
-    create_helper_context(ctx, &helper_context);
+    ERR(create_helper_context(ctx, &helper_context));
     /* AT THIS POINT, all resources are created. Now we need to connect the QPs */
 
     /* Now we need to move the QP through some state machine state, including connecting to remote QP */
-    init_qp(&helper_context, remote_qp_num);
+    ERR(init_qp(&helper_context, remote_qp_num));
 
     // Now we need to post a receive request (RR)
     // We happen to use the same wr for all recvs

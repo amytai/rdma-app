@@ -1,6 +1,8 @@
 #ifndef HELPER_H
 #define HELPER_H
 
+#include <elf.h>
+#include <stdio.h>
 #include <infiniband/verbs.h>
 
 #define DEBUG	1
@@ -19,6 +21,8 @@
 #define RECV_OPID	0xdead
 #define ONE_SIDED_WRITE_OPID    0x456
 
+/* IBV helper structs and functions */
+
 struct ibv_helper_context {
     struct ibv_context *ctx;
     struct ibv_qp *qp;
@@ -28,6 +32,12 @@ struct ibv_helper_context {
     struct ibv_mr *recv_mr;
 };
 
+int poll_cq(struct ibv_helper_context *helper_context, struct ibv_wc *wc);
+int create_helper_context(struct ibv_context *ctx, struct ibv_helper_context *helper_context);
+void destroy_helper_context(struct ibv_helper_context *helper_context);
+int init_qp(struct ibv_helper_context *helper_context, int remote_qp_num);
+
+/* Exokernel RPC helper structs and functions */
 enum rpc_type {
     rpc_region_request = 0,
     rpc_region_response = 1,
@@ -60,50 +70,8 @@ struct exokernel_rpc {
     } payload;
 };
 
-void marshall_region_request(struct region_request *req, void *buf) {
-    struct exokernel_rpc rpc = {
-        .type = rpc_region_request,
-        .payload.rreq = {
-            .start = req->start,
-            .size = req->size,
-        },
-    };
-    memcpy(buf, (void *) &rpc, sizeof(rpc));
-};
-
-void marshall_run_exokernel_request(struct run_exokernel_request *req, void *buf) {
-    struct exokernel_rpc rpc = {
-        .type = rpc_run_exokernel_request,
-        .payload.rereq = {
-            .stack_ptr = req->stack_ptr,
-            .entry_point = req->entry_point,
-        },
-    };
-    memcpy(buf, (void *) &rpc, sizeof(rpc));
-};
-
-void marshall_region_response(struct region_response *resp, void *buf) {
-    struct exokernel_rpc rpc = {
-        .type = rpc_region_response,
-        .payload.rresp = {
-            .success = resp->success,
-            .remote_addr = resp->remote_addr,
-            .rkey = resp->rkey,
-        },
-    };
-    memcpy(buf, (void *) &rpc, sizeof(rpc));
-}
-
-int parse_rpc_type(enum rpc_type type, void *buf) {
-    struct exokernel_rpc *rpc = (struct exokernel_rpc *) buf;
-    if (rpc->type != type) {
-        DEBUG_PRINT("Expected rpc_type %d but got rpc_type %d\n", type, rpc->type);
-        return -1;
-    }
-    // TODO: return paylod
-    return 0;
-}
-
-
+void marshall_region_request(struct region_request *req, void *buf);
+void marshall_run_exokernel_request(struct run_exokernel_request *req, void *buf);
+void marshall_region_response(struct region_response *resp, void *buf);
 
 #endif

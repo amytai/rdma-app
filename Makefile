@@ -2,10 +2,13 @@ OBJECTS := controller exokernel
 HELLO := helloworld
 ELF := elf
 
-all: $(OBJECTS) $(HELLO) $(ELF)
+all: helper $(OBJECTS) $(HELLO) $(ELF)
+
+helper:
+	gcc -c -I/usr/include/ helper.c
 
 $(OBJECTS): %: %.c
-	gcc -g -I/usr/include/ $< -o $@ -libverbs
+	gcc -g -I/usr/include/ $< -o $@ helper.o -libverbs
 
 $(HELLO): %: %.c
 	gcc -g -static -o $(HELLO) $< -static
