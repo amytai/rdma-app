@@ -10,7 +10,7 @@ int poll_cq(struct ibv_helper_context *helper_context, struct ibv_wc *wc) {
     ne = ibv_poll_cq(helper_context->cq, 1, wc);
     if (ne < 0) {
       DEBUG_PRINT("poll CQ failed %d\n", ne);
-      return 1;
+      return -1;
     }
 
   } while (ne < 1);
@@ -19,7 +19,7 @@ int poll_cq(struct ibv_helper_context *helper_context, struct ibv_wc *wc) {
   if (wc->status != IBV_WC_SUCCESS) {
     fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
             ibv_wc_status_str(wc->status), wc->status, (int)wc->wr_id);
-    return 1;
+    return -1;
   }
 
   return 0;
@@ -61,7 +61,7 @@ int create_helper_context(struct ibv_context *ctx,
 
   if (helper_context->qp == NULL) {
     DEBUG_PRINT("lol qp is null\n");
-    return 1;
+    return -1;
   }
 
   fprintf(stderr, "qp_num: %d\n", helper_context->qp->qp_num);
@@ -82,9 +82,9 @@ int create_helper_context(struct ibv_context *ctx,
       ibv_reg_mr(helper_context->pd, rdma_buf_read, BUF_SIZE,
                  IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
 
-  if (helper_context->send_mr || helper_context->recv_mr == NULL) {
+  if (helper_context->send_mr == NULL || helper_context->recv_mr == NULL) {
     printf("unf, ibv_reg_mr failed\n");
-    return 1;
+    return -1;
   }
 
   return 0;
